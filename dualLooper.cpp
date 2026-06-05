@@ -86,6 +86,7 @@ Oscillator led_oscA, led_oscB;
 float      ledBriA = 0.f, ledBriB = 0.f;
 
 // ── ADC ───────────────────────────────────────────────────────────────────────
+AnalogControl ctrlA, ctrlB;
 Parameter speedA, speedB;
 
 // ── Looper state ──────────────────────────────────────────────────────────────
@@ -290,18 +291,20 @@ int main(void)
     hw.adc.Init(adcCfg, 2);
     hw.adc.Start();
 
-    speedA.Init(hw.adc.GetPtr(0), 0.f, 1.f, Parameter::LINEAR);
-    speedB.Init(hw.adc.GetPtr(1), 0.f, 1.f, Parameter::LINEAR);
+    ctrlA.Init(hw.adc.GetPtr(0), hw.AudioCallbackRate());
+    ctrlB.Init(hw.adc.GetPtr(1), hw.AudioCallbackRate());
+    speedA.Init(ctrlA, 0.f, 1.f, Parameter::LINEAR);
+    speedB.Init(ctrlB, 0.f, 1.f, Parameter::LINEAR);
 
     // ── Switch / button setup ─────────────────────────────────────────────────
     // Switch::Init(pin, sample_rate, type, polarity, pull)
     // SWITCH_TYPE_MOMENTARY, active-low (INPUT_PULLUP), 1 kHz update rate
     float swRate = 1000.f;  // debounce update rate (Hz), called once per block
-    fsA.Init(PIN_FS_A,         swRate, Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, Switch::PULL_UP);
-    fsB.Init(PIN_FS_B,         swRate, Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, Switch::PULL_UP);
-    swSmooth.Init(PIN_SW_SMOOTH,    swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, Switch::PULL_UP);
-    swRevA.Init(PIN_SW_REVERSE_A,   swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, Switch::PULL_UP);
-    swRevB.Init(PIN_SW_REVERSE_B,   swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, Switch::PULL_UP);
+    fsA.Init(PIN_FS_A,         swRate, Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, GPIO::Pull::PULLUP);
+    fsB.Init(PIN_FS_B,         swRate, Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, GPIO::Pull::PULLUP);
+    swSmooth.Init(PIN_SW_SMOOTH,    swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, GPIO::Pull::PULLUP);
+    swRevA.Init(PIN_SW_REVERSE_A,   swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, GPIO::Pull::PULLUP);
+    swRevB.Init(PIN_SW_REVERSE_B,   swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, GPIO::Pull::PULLUP);
 
     // ── LED GPIO setup ────────────────────────────────────────────────────────
     ledPinA.Init(PIN_LED_A, GPIO::Mode::OUTPUT);
