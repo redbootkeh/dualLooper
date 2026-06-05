@@ -1,0 +1,23 @@
+{
+  "configurations": [
+    {
+      "name": "Daisy Seed (ARM)",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "${workspaceFolder}/../libDaisy/src/**",
+        "${workspaceFolder}/../libDaisy/Drivers/**",
+        "${workspaceFolder}/../DaisySP/Source/**"
+      ],
+      "defines": [
+        "STM32H750xx",
+        "USE_HAL_DRIVER",
+        "CORE_CM7"
+      ],
+      "compilerPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/13.2 Rel1/bin/arm-none-eabi-gcc.exe",
+      "cStandard": "c11",
+      "cppStandard": "c++14",
+      "intelliSenseMode": "gcc-arm"
+    }
+  ],
+  "version": 4
+}
