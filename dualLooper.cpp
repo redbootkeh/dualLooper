@@ -1,82 +1,118 @@
 // dualLooper.cpp
-// 2-Channel Variable Speed Looper for GuitarML Funbox / Daisy Seed
-// Based on Pluto by Keith Bloemer
+// 2-Channel Variable Speed Looper for bare Daisy Seed
 //
-// Controls:
-//   Knob 1 (KNOB_1) — Loop A Speed  (-2x..+2x, noon = 1x)
-//   Knob 2 (KNOB_2) — Loop B Speed  (-2x..+2x, noon = 1x)
+// ┌─────────────────────────────────────────────────────────┐
+// │  PIN ASSIGNMENTS  (all Daisy Seed pin numbers)          │
+// │                                                         │
+// │  ANALOG IN                                              │
+// │    PIN_ADC_SPEED_A  = A0 (PIN 15)  — Loop A speed knob  │
+// │    PIN_ADC_SPEED_B  = A1 (PIN 16)  — Loop B speed knob  │
+// │                                                         │
+// │  DIGITAL IN (active-low, internal pull-up)              │
+// │    PIN_FS_A         = D0 (PIN 0)   — Footswitch A       │
+// │    PIN_FS_B         = D1 (PIN 1)   — Footswitch B       │
+// │    PIN_SW_SMOOTH    = D2 (PIN 2)   — Speed mode toggle  │
+// │                        (open=stepped, GND=smooth)       │
+// │    PIN_SW_REVERSE_A = D3 (PIN 3)   — Reverse loop A     │
+// │    PIN_SW_REVERSE_B = D4 (PIN 4)   — Reverse loop B     │
+// │                                                         │
+// │  DIGITAL OUT                                            │
+// │    PIN_LED_A        = D25 (PIN 25) — LED loop A         │
+// │    PIN_LED_B        = D26 (PIN 26) — LED loop B         │
+// │                                                         │
+// │  AUDIO                                                  │
+// │    Audio In  Left   — Loop A input                      │
+// │    Audio In  Right  — Loop B input                      │
+// │    Audio Out Left   — Loop A + Loop B + dry L (stereo)  │
+// │    Audio Out Right  — Loop A + Loop B + dry R (stereo)  │
+// └─────────────────────────────────────────────────────────┘
 //
-//   Switch 1 LEFT   — Smooth speed transitions
-//   Switch 1 CENTER — Stepped speed (fixed increments)
-//   Switch 1 RIGHT  — (reserved / future)
+// Footswitch behaviour (per channel):
+//   Single tap  — start recording / stop recording & play / overdub
+//   Double tap  — pause / resume playback
+//   Hold 1 s    — clear loop
 //
-//   Switch 2 LEFT   — MISO (left channel to both loopers)
-//   Switch 2 RIGHT  — Stereo (L->A, R->B)
+// LED behaviour:
+//   Pulsing     — recording
+//   Solid on    — playing
+//   Blinking    — paused
+//   Off         — empty
 //
-//   FS 1  — Loop A: tap=rec/stop/overdub, double-tap=pause, hold=clear
-//   FS 2  — Loop B: tap=rec/stop/overdub, double-tap=pause, hold=clear
-//
-//   LED 1 — Loop A: pulse=recording, solid=playing, blink=paused
-//   LED 2 — Loop B: same
-//
-//   Dipswitch 1 — Reverse Loop A
-//   Dipswitch 2 — Reverse Loop B
-//
-// Loop mode is fixed to NORMAL.
-// Output level is fixed at unity (no volume knobs).
+// Speed knob:
+//   0 (full CCW)  → -2x (reverse double speed)
+//   noon (0.5)    →  1x (normal forward)
+//   1 (full CW)   → +2x (forward double speed)
+//   SW_SMOOTH closed → smooth continuous transitions
+//   SW_SMOOTH open   → stepped fixed increments
 
-#include "daisy_petal.h"
+#include "daisy_seed.h"
 #include "daisysp.h"
 #include "varSpeedLooper.h"
-#include "funbox.h"
 
 using namespace daisy;
 using namespace daisysp;
-using namespace funbox;
 
-// ── Hardware ─────────────────────────────────────────────────────────────────
-DaisyPetal hw;
+// ── Pin definitions ───────────────────────────────────────────────────────────
+static constexpr Pin PIN_ADC_SPEED_A  = seed::A0;   // PIN 15
+static constexpr Pin PIN_ADC_SPEED_B  = seed::A1;   // PIN 16
 
-// ── Looper buffers (SDRAM, 60 s @ 96 kHz) ────────────────────────────────────
+static constexpr Pin PIN_FS_A         = seed::D0;   // PIN 0
+static constexpr Pin PIN_FS_B         = seed::D1;   // PIN 1
+static constexpr Pin PIN_SW_SMOOTH    = seed::D2;   // PIN 2  (GND = smooth)
+static constexpr Pin PIN_SW_REVERSE_A = seed::D3;   // PIN 3  (GND = reverse)
+static constexpr Pin PIN_SW_REVERSE_B = seed::D4;   // PIN 4  (GND = reverse)
+
+static constexpr Pin PIN_LED_A        = seed::D25;  // PIN 25
+static constexpr Pin PIN_LED_B        = seed::D26;  // PIN 26
+
+// ── Hardware ──────────────────────────────────────────────────────────────────
+DaisySeed hw;
+
+// ── Looper buffers  (SDRAM, 60 s @ 96 kHz) ───────────────────────────────────
 #define MAX_SIZE (96000 * 60)
 float DSY_SDRAM_BSS bufA[MAX_SIZE];
 float DSY_SDRAM_BSS bufB[MAX_SIZE];
 
 varSpeedLooper looperA, looperB;
 
-// ── Parameters ────────────────────────────────────────────────────────────────
+// ── GPIO objects ──────────────────────────────────────────────────────────────
+Switch  fsA, fsB;           // footswitches
+Switch  swSmooth;           // speed mode toggle
+Switch  swRevA, swRevB;     // reverse toggles
+GPIO    ledPinA, ledPinB;   // LED outputs
+
+// ── LED oscillators ───────────────────────────────────────────────────────────
+Oscillator led_oscA, led_oscB;
+float      ledBriA = 0.f, ledBriB = 0.f;
+
+// ── ADC ───────────────────────────────────────────────────────────────────────
 Parameter speedA, speedB;
 
-// ── LEDs & oscillators for visual feedback ────────────────────────────────────
-Led        led1, led2;
-Oscillator led_oscA, led_oscB;
-float      ledBriA, ledBriB;
-
-// ── Footswitch state ──────────────────────────────────────────────────────────
-bool pauseA    = false, pauseB    = false;
+// ── Looper state ──────────────────────────────────────────────────────────────
+bool pauseA     = false, pauseB     = false;
 bool isPlayingA = false, isPlayingB = false;
 
-int  dblCntA = 0, dblCntB = 0;
+int  dblCntA = 0,  dblCntB = 0;
 bool chkDblA = false, chkDblB = false;
 
-// ── Switch / dip state ────────────────────────────────────────────────────────
-int  sw1[2], sw2[2], dip[4];
-bool psw1[2], psw2[2], pdip[4];
-int  sw1_action = 1;   // 0=smooth, 1=stepped, 2=future
-int  sw2_action = 0;   // 0=MISO,   2=Stereo
-
 // ── Speed smoothing ───────────────────────────────────────────────────────────
-float curSpeedA = 1.0f, curSpeedB = 1.0f;
+float curSpeedA = 1.f, curSpeedB = 1.f;
 
-// ── Speed mapping helpers ─────────────────────────────────────────────────────
-
-// Smooth: knob 0..0.5 -> -2x..1x,  0.5..1.0 -> 1x..2x
-static inline float KnobToSpeed(float v)
+// ── LED helpers (manual PWM via oscillator value) ─────────────────────────────
+// We drive the LED pin high/low based on the oscillator brightness threshold.
+static inline void SetLed(GPIO &pin, float brightness)
 {
-    return (v <= 0.5f) ? (v * 6.0f - 2.0f) : (v * 2.0f);
+    // Simple threshold: >0.5 = on.  Gives a natural blink/pulse from the osc.
+    pin.Write(brightness > 0.5f);
 }
 
-// Stepped: fixed speed increments
+// ── Speed mapping ─────────────────────────────────────────────────────────────
+static inline float KnobToSpeed(float v)
+{
+    // 0..0.5 → -2x..1x,   0.5..1.0 → 1x..2x
+    return (v <= 0.5f) ? (v * 6.f - 2.f) : (v * 2.f);
+}
+
 static inline float KnobToSteppedSpeed(float v)
 {
     if(v < 0.05f) return -2.0f;
@@ -93,39 +129,25 @@ static inline float KnobToSteppedSpeed(float v)
 
 static inline void ApplySpeed(varSpeedLooper &lp, float spd)
 {
-    lp.SetReverse(spd < 0.0f);
+    lp.SetReverse(spd < 0.f);
     lp.SetIncrementSize(fabsf(spd));
 }
 
-// ── Switch update helpers ─────────────────────────────────────────────────────
-
-void UpdateSw1()
-{
-    if      (psw1[0]) sw1_action = 0;   // left   = smooth
-    else if (psw1[1]) sw1_action = 2;   // right  = future
-    else              sw1_action = 1;   // center = stepped
-}
-
-void UpdateSw2()
-{
-    if      (psw2[0]) sw2_action = 0;   // left  = MISO
-    else if (psw2[1]) sw2_action = 2;   // right = Stereo
-    else              sw2_action = 0;   // center defaults to MISO
-}
-
-// ── Footswitch handler (reusable per channel) ─────────────────────────────────
+// ── Footswitch handler ────────────────────────────────────────────────────────
 static void HandleFootswitch(
     varSpeedLooper &lp,
-    bool  risingEdge,
-    int   timeHeldMs,
-    bool &pause,
-    bool &isPlaying,
-    int  &dblCnt,
-    bool &chkDbl,
-    Led  &led,
-    Oscillator &osc)
+    Switch         &sw,
+    bool           &pause,
+    bool           &isPlaying,
+    int            &dblCnt,
+    bool           &chkDbl,
+    GPIO           &ledPin,
+    Oscillator     &osc)
 {
-    if(risingEdge)
+    bool rising   = sw.RisingEdge();
+    int  heldMs   = (int)sw.TimeHeldMs();
+
+    if(rising)
     {
         if(!pause)
         {
@@ -133,7 +155,7 @@ static void HandleFootswitch(
             isPlaying = false;
             if(!lp.Recording())
             {
-                led.Set(1.0f);
+                ledPin.Write(true);
                 isPlaying = true;
             }
         }
@@ -142,12 +164,12 @@ static void HandleFootswitch(
         {
             if(dblCnt <= 1000)
             {
-                if(lp.Recording()) lp.TrigRecord();  // stop recording before pausing
+                if(lp.Recording()) lp.TrigRecord();   // stop rec before pausing
                 pause = !pause;
-                osc.SetWaveform(pause ? 4 : 1);      // 4=square(blink), 1=tri(pulse)
+                osc.SetWaveform(pause ? 4 : 1);        // 4=square blink, 1=tri pulse
                 dblCnt = 0;
                 chkDbl = false;
-                led.Set(1.0f);
+                ledPin.Write(true);
             }
         }
         else
@@ -156,57 +178,20 @@ static void HandleFootswitch(
         }
     }
 
-    // Double-tap timer
+    // Double-tap window timer
     if(chkDbl)
     {
         dblCnt++;
         if(dblCnt > 1000) { dblCnt = 0; chkDbl = false; }
     }
 
-    // Hold to clear
-    if(timeHeldMs >= 1000)
+    // Hold ≥ 1 s → clear
+    if(heldMs >= 1000)
     {
         pause = false;
         osc.SetWaveform(1);
         lp.Clear();
-        led.Set(0.0f);
-    }
-}
-
-void UpdateButtons()
-{
-    HandleFootswitch(looperA,
-        hw.switches[Funbox::FOOTSWITCH_1].RisingEdge(),
-        (int)hw.switches[Funbox::FOOTSWITCH_1].TimeHeldMs(),
-        pauseA, isPlayingA, dblCntA, chkDblA, led1, led_oscA);
-
-    HandleFootswitch(looperB,
-        hw.switches[Funbox::FOOTSWITCH_2].RisingEdge(),
-        (int)hw.switches[Funbox::FOOTSWITCH_2].TimeHeldMs(),
-        pauseB, isPlayingB, dblCntB, chkDblB, led2, led_oscB);
-}
-
-void UpdateSwitches()
-{
-    bool c1 = false, c2 = false;
-
-    for(int i = 0; i < 2; i++)
-    {
-        if(hw.switches[sw1[i]].Pressed() != psw1[i]) { psw1[i] = hw.switches[sw1[i]].Pressed(); c1 = true; }
-        if(hw.switches[sw2[i]].Pressed() != psw2[i]) { psw2[i] = hw.switches[sw2[i]].Pressed(); c2 = true; }
-    }
-    if(c1) UpdateSw1();
-    if(c2) UpdateSw2();
-
-    // Dipswitches 1 & 2 = hard reverse for A and B
-    for(int i = 0; i < 4; i++)
-    {
-        if(hw.switches[dip[i]].Pressed() != pdip[i])
-        {
-            pdip[i] = hw.switches[dip[i]].Pressed();
-            if(i == 0) looperA.SetReverse(pdip[0]);
-            if(i == 1) looperB.SetReverse(pdip[1]);
-        }
+        ledPin.Write(false);
     }
 }
 
@@ -215,18 +200,32 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer out,
                           size_t                    size)
 {
-    hw.ProcessAnalogControls();
-    hw.ProcessDigitalControls();
-    UpdateButtons();
-    UpdateSwitches();
+    // Debounce all switches
+    fsA.Debounce();
+    fsB.Debounce();
+    swSmooth.Debounce();
+    swRevA.Debounce();
+    swRevB.Debounce();
 
-    // Read speed knobs
+    // Footswitch handlers
+    HandleFootswitch(looperA, fsA, pauseA, isPlayingA,
+                     dblCntA, chkDblA, ledPinA, led_oscA);
+    HandleFootswitch(looperB, fsB, pauseB, isPlayingB,
+                     dblCntB, chkDblB, ledPinB, led_oscB);
+
+    // Reverse toggles (active-low: Pressed() == GND connected)
+    looperA.SetReverse(swRevA.Pressed());
+    looperB.SetReverse(swRevB.Pressed());
+
+    // Speed mode: smooth when switch is held/closed, stepped otherwise
+    bool smoothMode = swSmooth.Pressed();
+
+    // Read ADC speed knobs (0..1)
     float vspeedA = speedA.Process();
     float vspeedB = speedB.Process();
 
-    // Compute target speeds and apply immediately in stepped mode
     float tgtSpeedA, tgtSpeedB;
-    if(sw1_action == 0)
+    if(smoothMode)
     {
         tgtSpeedA = KnobToSpeed(vspeedA);
         tgtSpeedB = KnobToSpeed(vspeedB);
@@ -235,18 +234,19 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     {
         tgtSpeedA = KnobToSteppedSpeed(vspeedA);
         tgtSpeedB = KnobToSteppedSpeed(vspeedB);
+        // Apply immediately in stepped mode (outside per-sample loop)
         ApplySpeed(looperA, tgtSpeedA);
         ApplySpeed(looperB, tgtSpeedB);
     }
 
-    // Per-sample loop
+    // Per-sample processing
     for(size_t i = 0; i < size; i++)
     {
         ledBriA = led_oscA.Process();
         ledBriB = led_oscB.Process();
 
-        // Smooth speed transitions (smooth mode only)
-        if(sw1_action == 0)
+        // Smooth speed glide
+        if(smoothMode)
         {
             fonepole(curSpeedA, tgtSpeedA, 0.00006f);
             fonepole(curSpeedB, tgtSpeedB, 0.00006f);
@@ -254,38 +254,25 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
             ApplySpeed(looperB, curSpeedB);
         }
 
-        // Input routing
-        float inL = in[0][i];
-        float inR = (sw2_action == 2) ? in[1][i] : in[0][i];
+        float inL = in[0][i];   // Loop A source  (left  / mono)
+        float inR = in[1][i];   // Loop B source  (right / mono)
 
-        // Process loopers (unity gain)
-        float outA = 0.0f, outB = 0.0f;
+        float outA = 0.f, outB = 0.f;
         if(!pauseA) outA = looperA.Process(inL);
         if(!pauseB) outB = looperB.Process(inR);
 
-        // Output routing
-        if(sw2_action == 2)   // Stereo: A->L, B->R
-        {
-            out[0][i] = inL + outA;
-            out[1][i] = inR + outB;
-        }
-        else                  // MISO: mix both to both channels
-        {
-            out[0][i] = inL + outA + outB;
-            out[1][i] = inL + outA + outB;
-        }
+        // Both loopers mixed to both channels — full stereo output
+        out[0][i] = inL + outA + outB;   // left  = dry L + loop A + loop B
+        out[1][i] = inR + outA + outB;   // right = dry R + loop A + loop B
     }
 
-    // LED visual feedback
-    if(looperA.Recording())      led1.Set(ledBriA * 0.5f + 0.5f);  // pulse while recording
-    else if(pauseA)               led1.Set(ledBriA * 2.0f);          // blink while paused
-    // solid on = set by button handler on playback start
+    // LED visual feedback (applied after sample loop)
+    if(looperA.Recording())      SetLed(ledPinA, ledBriA * 0.5f + 0.5f);  // pulse
+    else if(pauseA)               SetLed(ledPinA, ledBriA);                 // blink
+    // solid on is handled by Write(true) in HandleFootswitch
 
-    if(looperB.Recording())      led2.Set(ledBriB * 0.5f + 0.5f);
-    else if(pauseB)               led2.Set(ledBriB * 2.0f);
-
-    led1.Update();
-    led2.Update();
+    if(looperB.Recording())      SetLed(ledPinB, ledBriB * 0.5f + 0.5f);
+    else if(pauseB)               SetLed(ledPinB, ledBriB);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -296,49 +283,54 @@ int main(void)
     hw.SetAudioBlockSize(48);
     float sr = hw.AudioSampleRate();  // 96000
 
-    // Map switch/dip pins
-    sw1[0] = Funbox::SWITCH_1_LEFT;   sw1[1] = Funbox::SWITCH_1_RIGHT;
-    sw2[0] = Funbox::SWITCH_2_LEFT;   sw2[1] = Funbox::SWITCH_2_RIGHT;
-    dip[0] = Funbox::SWITCH_DIP_1;
-    dip[1] = Funbox::SWITCH_DIP_2;
-    dip[2] = Funbox::SWITCH_DIP_3;
-    dip[3] = Funbox::SWITCH_DIP_4;
+    // ── ADC setup ─────────────────────────────────────────────────────────────
+    AdcChannelConfig adcCfg[2];
+    adcCfg[0].InitSingle(PIN_ADC_SPEED_A);
+    adcCfg[1].InitSingle(PIN_ADC_SPEED_B);
+    hw.adc.Init(adcCfg, 2);
+    hw.adc.Start();
 
-    for(int i = 0; i < 2; i++) psw1[i] = psw2[i] = false;
-    for(int i = 0; i < 4; i++) pdip[i] = false;
+    speedA.Init(hw.adc.GetPtr(0), 0.f, 1.f, Parameter::LINEAR);
+    speedB.Init(hw.adc.GetPtr(1), 0.f, 1.f, Parameter::LINEAR);
 
-    // Speed knobs only — no level knobs
-    speedA.Init(hw.knob[Funbox::KNOB_1], 0.0f, 1.0f, Parameter::LINEAR);
-    speedB.Init(hw.knob[Funbox::KNOB_2], 0.0f, 1.0f, Parameter::LINEAR);
+    // ── Switch / button setup ─────────────────────────────────────────────────
+    // Switch::Init(pin, sample_rate, type, polarity, pull)
+    // SWITCH_TYPE_MOMENTARY, active-low (INPUT_PULLUP), 1 kHz update rate
+    float swRate = 1000.f;  // debounce update rate (Hz), called once per block
+    fsA.Init(PIN_FS_A,         swRate, Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, Switch::PULL_UP);
+    fsB.Init(PIN_FS_B,         swRate, Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, Switch::PULL_UP);
+    swSmooth.Init(PIN_SW_SMOOTH,    swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, Switch::PULL_UP);
+    swRevA.Init(PIN_SW_REVERSE_A,   swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, Switch::PULL_UP);
+    swRevB.Init(PIN_SW_REVERSE_B,   swRate, Switch::TYPE_TOGGLE,    Switch::POLARITY_INVERTED, Switch::PULL_UP);
 
-    // Looper A — fixed NORMAL mode
-    looperA.Init(bufA, MAX_SIZE);
-    looperA.SetMode(varSpeedLooper::Mode::NORMAL);
+    // ── LED GPIO setup ────────────────────────────────────────────────────────
+    ledPinA.Init(PIN_LED_A, GPIO::Mode::OUTPUT);
+    ledPinB.Init(PIN_LED_B, GPIO::Mode::OUTPUT);
+    ledPinA.Write(false);
+    ledPinB.Write(false);
+
+    // ── LED oscillators ───────────────────────────────────────────────────────
     led_oscA.Init(sr);
     led_oscA.SetFreq(1.5f);
-    led_oscA.SetWaveform(1);  // triangle
-    ledBriA   = 0.0f;
-    pauseA    = false;
-    curSpeedA = 1.0f;
+    led_oscA.SetWaveform(Oscillator::WAVE_TRI);
 
-    // Looper B — fixed NORMAL mode
-    looperB.Init(bufB, MAX_SIZE);
-    looperB.SetMode(varSpeedLooper::Mode::NORMAL);
     led_oscB.Init(sr);
     led_oscB.SetFreq(1.5f);
-    led_oscB.SetWaveform(1);
-    ledBriB   = 0.0f;
+    led_oscB.SetWaveform(Oscillator::WAVE_TRI);
+
+    // ── Loopers ───────────────────────────────────────────────────────────────
+    looperA.Init(bufA, MAX_SIZE);
+    looperA.SetMode(varSpeedLooper::Mode::NORMAL);
+    pauseA    = false;
+    curSpeedA = 1.f;
+
+    looperB.Init(bufB, MAX_SIZE);
+    looperB.SetMode(varSpeedLooper::Mode::NORMAL);
     pauseB    = false;
-    curSpeedB = 1.0f;
+    curSpeedB = 1.f;
 
-    // LEDs
-    led1.Init(hw.seed.GetPin(Funbox::LED_1), false);
-    led1.Update();
-    led2.Init(hw.seed.GetPin(Funbox::LED_2), false);
-    led2.Update();
-
-    hw.StartAdc();
+    // ── Start audio ───────────────────────────────────────────────────────────
     hw.StartAudio(AudioCallback);
 
-    while(1) { /* nothing */ }
+    while(1) { /* nothing to poll */ }
 }
